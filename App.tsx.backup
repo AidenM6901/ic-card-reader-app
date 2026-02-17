@@ -1,0 +1,207 @@
+import React, { useState, useEffect } from 'react';
+import {
+  Vibration, Image, SafeAreaView, ScrollView, StatusBar,
+  StyleSheet, Text, useColorScheme, View, Alert, TouchableOpacity,
+} from 'react-native';
+import { Colors } from 'react-native/Libraries/NewAppScreen';
+import NfcManager, { NfcTech, NfcEvents } from 'react-native-nfc-manager';
+
+// --- Mappings ---
+
+const TERMINAL_MAP: Record<number, string> = {
+  0x03: 'Ticket Kiosk', 0x04: 'Card Dispenser', 0x05: 'Bus', 
+  0x07: 'Ticket Kiosk', 0x08: 'Ticket Kiosk', 0x09: 'Quick Charge',
+  0x12: 'Vending', 0x16: 'Gate', 0x1d: 'Mobile', 0xc7: 'Retail', 0xc8: 'Retail'
+};
+
+const PROCESS_MAP: Record<number, string> = {
+  0x01: 'Fare', 0x02: 'Charge', 0x05: 'Adjustment',
+  0x06: 'Staff Window', 0x0d: 'Bus (Flat Rate)', 0x0f: 'Bus Fare', 
+  0x11: 'Reissue', 0x46: 'Purchase', 0x48: 'Benefit'
+};
+
+// Maps Issuer Service IDs to actual Brand Names
+const ISSUER_MAP: Record<number, string> = {
+  0x0001: 'Suica',
+  0x0002: 'ICOCA',
+  0x0003: 'Pasmo',
+  0x0006: 'Sugoca',
+  0x0008: 'Nimoca',
+};
+
+NfcManager.start();
+
+function App(): React.JSX.Element {
+  const isDarkMode = useColorScheme() === 'dark';
+  const backgroundStyle = { backgroundColor: isDarkMode ? Colors.darker : Colors.lighter };
+
+  const [cardData, setCardData] = useState({
+    balance: '0',
+    id: 'Ready to Scan',
+    brand: 'IC Card',
+    history: [] as any[],
+  });
+
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    NfcManager.setEventListener(NfcEvents.DiscoverTag, () => readSuica());
+    return () => NfcManager.setEventListener(NfcEvents.DiscoverTag, null);
+  }, []);
+
+  async function readSuica() {
+    if (loading) return;
+    setLoading(true);
+
+    try {
+      setCardData(prev => ({ ...prev, id: 'Connecting...', brand: 'Hold Steady' }));
+      await NfcManager.cancelTechnologyRequest().catch(() => 0);
+      await NfcManager.requestTechnology(NfcTech.NfcF);
+
+      // 1. Polling for IDm
+      const pollCmd = [0x06, 0x00, 0xff, 0xff, 0x01, 0x00];
+      const pollResp = await NfcManager.transceive(pollCmd);
+      if (!pollResp || pollResp.length < 10) throw new Error("Card lost");
+
+      const idm = pollResp.slice(2, 10);
+      const idmHex = idm.map((b: number) => b.toString(16).padStart(2, '0')).join('');
+
+      // 2. Identify Brand via Issuer Service (0x008b)
+      // This solves the 0101 prefix conflict
+      let detectedBrand = 'Standard IC Card';
+      try {
+        const issuerCmd = [0x06, ...idm, 1, 0x8b, 0x00, 1, 0x80, 0x00];
+        const issuerPacket = [issuerCmd.length + 1, ...issuerCmd];
+        const issuerResp = await NfcManager.transceive(issuerPacket);
+        if (issuerResp && issuerResp[10] === 0) {
+          const issuerId = (issuerResp[13] << 8) | issuerResp[14];
+          detectedBrand = ISSUER_MAP[issuerId] || 'National IC Card';
+        }
+      } catch (e) {
+        console.log("Issuer check failed, falling back to IDm prefix");
+      }
+
+      // 3. Optimized Multi-block Read
+      const numBlocks = 10;
+      const blockList = [];
+      for (let i = 0; i < numBlocks; i++) blockList.push(0x80, i);
+
+      const histCmd = [0x06, ...idm, 1, 0x0f, 0x09, numBlocks, ...blockList];
+      const histPacket = [histCmd.length + 1, ...histCmd];
+      const response = await NfcManager.transceive(histPacket);
+
+      let tempHistory: any[] = [];
+      if (response && response[10] === 0) {
+        for (let i = 0; i < response[12]; i++) {
+          const offset = 13 + (i * 16);
+          const block = response.slice(offset, offset + 16);
+          const dateRaw = (block[4] << 8) | block[5];
+          const balance = block[10] + (block[11] << 8);
+
+          tempHistory.push({
+            balance,
+            terminal: TERMINAL_MAP[block[0]] || `ID:${block[0]}`,
+            process: PROCESS_MAP[block[1]] || `Proc:${block[1]}`,
+            date: `${2000 + ((dateRaw >> 9) & 0x7f)}/${(dateRaw >> 5) & 0x0f}/${dateRaw & 0x1f}`,
+            key: `${idmHex}-${i}-${balance}`,
+          });
+        }
+      }
+
+      // 4. Finalize
+      const finalizedHistory = tempHistory.map((item, index) => {
+        const nextItem = tempHistory[index + 1];
+        const diff = nextItem ? item.balance - nextItem.balance : 0;
+        return { ...item, diff };
+      });
+
+      Vibration.vibrate(100);
+      setCardData({
+        brand: detectedBrand,
+        balance: finalizedHistory[0]?.balance.toString() || '0',
+        id: 'Success!',
+        history: finalizedHistory,
+      });
+
+    } catch (e) {
+      console.error(e);
+      setCardData(prev => ({ ...prev, id: 'Scan Failed' }));
+      Alert.alert("Error", "Keep card steady against the NFC reader.");
+    } finally {
+      await NfcManager.cancelTechnologyRequest().catch(() => 0);
+      setLoading(false);
+    }
+  }
+
+  return (
+    <SafeAreaView style={[backgroundStyle, { flex: 1 }]}>
+      <StatusBar barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
+
+      <View style={styles.centerContainer}>
+        <Image source={require('./resources/ic.png')} style={styles.icCardImage} resizeMode="cover" />
+        <Text style={[styles.brandText, { color: isDarkMode ? '#fff' : '#000' }]}>
+          {cardData.brand}
+        </Text>
+      </View>
+
+      <View style={styles.dataWrapper}>
+        <Text style={[styles.label, { color: isDarkMode ? '#aaa' : '#666' }]}>CURRENT BALANCE</Text>
+        <Text style={[styles.balanceText, { color: isDarkMode ? '#fff' : '#000' }]}>¥{cardData.balance}</Text>
+        <Text style={styles.statusText}>{cardData.id}</Text>
+      </View>
+
+      <View style={{ flex: 1, paddingHorizontal: 30 }}>
+        <Text style={{ fontWeight: 'bold', marginBottom: 10, color: isDarkMode ? '#fff' : '#000' }}>
+          Recent Activity:
+        </Text>
+        <ScrollView showsVerticalScrollIndicator={false} style={{ marginBottom: 25 }}>
+          {cardData.history.map((item) => (
+            <View key={item.key} style={styles.historyRow}>
+              <View>
+                <Text style={{ fontWeight: 'bold', color: isDarkMode ? '#fff' : '#000' }}>
+                  {item.process} <Text style={{ fontSize: 10, color: '#888', fontWeight: 'normal' }}>({item.terminal})</Text>
+                </Text>
+                <Text style={{ fontSize: 12, color: '#888' }}>{item.date}</Text>
+              </View>
+              <View style={{ alignItems: 'flex-end' }}>
+                <Text style={{
+                  fontWeight: 'bold',
+                  color: item.diff > 0 ? '#28a745' : (item.diff < 0 ? '#dc3545' : '#888')
+                }}>
+                  {item.diff > 0 ? '+' : ''}{item.diff !== 0 ? `¥${item.diff}` : '--'}
+                </Text>
+                <Text style={{ fontSize: 10, color: '#aaa' }}>Bal: ¥{item.balance}</Text>
+              </View>
+            </View>
+          ))}
+        </ScrollView>
+      </View>
+
+      <View style={styles.buttonContainer}>
+        <TouchableOpacity
+          onPress={readSuica}
+          style={[styles.scanButton, loading && { backgroundColor: '#555' }]}
+          disabled={loading}
+        >
+          <Text style={styles.buttonText}>{loading ? 'SCANNING...' : 'SCAN CARD'}</Text>
+        </TouchableOpacity>
+      </View>
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  centerContainer: { height: 220, justifyContent: 'center', alignItems: 'center', marginTop: 20 },
+  icCardImage: { width: 300, height: 180, borderRadius: 15, borderWidth: 1, borderColor: '#ccc' },
+  brandText: { marginTop: 15, fontSize: 20, fontWeight: 'bold' },
+  dataWrapper: { alignItems: 'center', marginVertical: 20 },
+  label: { fontSize: 12, letterSpacing: 1 },
+  balanceText: { fontSize: 48, fontWeight: 'bold' },
+  statusText: { marginTop: 5, fontSize: 14, fontWeight: '600', color: '#28a745' },
+  historyRow: { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: '#eee' },
+  buttonContainer: { paddingBottom: 40, alignItems: 'center' },
+  scanButton: { backgroundColor: '#28a745', paddingVertical: 15, paddingHorizontal: 60, borderRadius: 30 },
+  buttonText: { color: 'white', fontWeight: 'bold', fontSize: 16 },
+});
+
+export default App;
